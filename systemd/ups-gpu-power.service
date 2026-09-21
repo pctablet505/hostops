@@ -1,0 +1,40 @@
+[Unit]
+# Holds the NVIDIA power limit inside what the UPS can carry: 550 W on mains,
+# 200 W on battery. Reacts to the UPS's pushed HID report, not a poll.
+#
+# Install (needs root -- it writes the GPU power limit and reads /dev/hidraw):
+#   sudo install -m 0755 bin/ups-gpu-power /usr/local/bin/ups-gpu-power
+#   sudo cp systemd/ups-gpu-power.service /etc/systemd/system/
+#   sudo systemctl disable --now nvidia-power-limit.service   # superseded
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ups-gpu-power
+#
+# nvidia-power-limit.service is disabled above on purpose: two units writing
+# the same limit race at boot, and the loser wins silently.
+Description=Hold the GPU power limit inside the UPS budget
+Documentation=file:/home/pctablet505/Projects/hostops/docs/UPS-GPU-POWER.md
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ups-gpu-power
+Restart=always
+RestartSec=5
+
+# The daemon needs root for nvidia-smi and /dev/hidraw; everything else is off.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

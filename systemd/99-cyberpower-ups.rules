@@ -1,0 +1,5 @@
+# Let the owner's account read the UPS without sudo, so `ups-gpu-power --check`
+# is a diagnostic anyone can run. The daemon itself runs as root (it also has
+# to write the GPU power limit); this rule exists purely for observability.
+# Read-only in practice: nothing but the daemon issues SET_REPORT.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0764", ATTRS{idProduct}=="0601", MODE="0660", GROUP="plugdev"

@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Hold the GPU's power limit inside what the UPS can actually carry.
+
+Mains present  -> MAINS_WATTS
+On battery     -> BATTERY_WATTS
+State unknown  -> BATTERY_WATTS (fail low, never fail open)
+
+WHY THIS EXISTS
+---------------
+The box draws from a CyberPower OLS2000EC (2000 VA / 1800 W, online
+double-conversion). At 1800 W the UPS can *carry* the GPU at full tilt, so
+this is not an overload guard -- it is a RUNTIME guard. Battery runtime falls
+roughly as the inverse of load, so the difference between a 550 W and a 200 W
+GPU cap is the difference between a UPS that rides out a flicker and one that
+dies mid-write.
+
+The transfer to battery is detected from the UPS's own HID *input* report,
+which the device PUSHES on change. A polling loop would leave the GPU at the
+mains cap for the whole poll interval after a cut; a blocking read reacts in
+milliseconds. That is the entire reason this is a daemon and not a cron job.
+
+WHY 550 W IS THE CEILING
+------------------------
+Recorded incident 2026-09-11: the card threw Xid 79 ("GPU has fallen off the
+bus") 3 min 52 s after the limit went 550 -> 600 W under full load, and only a
+reboot recovered it. 550 W itself ran ~1.5 h clean under saturation stress.
+HARD_MAX below is set at 550 deliberately. Do not raise it without a power
+path that has actually been measured -- see docs/UPS-GPU-POWER.md.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import select
+import subprocess
+import sys
+import time
+
+MAINS_WATTS = 550
+BATTERY_WATTS = 200
+
+#: Never exceed this, whatever the caller asks for. See the docstring.
+HARD_MAX = 550
+#: The card refuses anything under its own floor; clamp rather than error.
+HARD_MIN = 150
+
+UPS_VID, UPS_PID = "0764", "0601"
+
+#: Report 11 byte 0: bit0 ACPresent, bit1 Charging, bit2 Discharging.
+#: Report 8: capacity% then RunTimeToEmpty (16-bit LE seconds).
+#: Report 19: PercentLoad. All three decoded from the device's own report
+#: descriptor (world-readable at device/report_descriptor), not guessed.
+STATUS_REPORT = 11
+BATTERY_REPORT = 8
+LOAD_REPORT = 19
+
+RECONNECT_DELAY = 5.0
+#: Belt-and-braces resync: the push report is the primary signal, but a missed
+#: event must not strand the cap at 550 W on battery forever.
+RESYNC_INTERVAL = 30.0
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _hidiocgfeature(size: int) -> int:
+    """_IOC(READ|WRITE, 'H', 0x07, size) -- the HIDIOCGFEATURE ioctl."""
+    return 0xC0000000 | (size << 16) | (0x48 << 8) | 0x07
+
+
+def find_ups() -> str | None:
+    """Resolve the UPS by vendor/product, never by a hidrawN that can shift."""
+    base = "/sys/class/hidraw"
+    try:
+        nodes = sorted(os.listdir(base))
+    except OSError:
+        return None
+    for node in nodes:
+        try:
+            with open(f"{base}/{node}/device/uevent") as handle:
+                uevent = handle.read()
+        except OSError:
+            continue
+        if f"HID_ID=0003:0000{UPS_VID.upper()}:0000{UPS_PID.upper()}" in uevent.upper():
+            return f"/dev/{node}"
+    return None
+
+
+def feature(fd: int, report_id: int, size: int) -> bytes | None:
+    buf = bytearray(size + 1)
+    buf[0] = report_id
+    try:
+        fcntl.ioctl(fd, _hidiocgfeature(len(buf)), buf, True)
+    except OSError:
+        return None
+    return bytes(buf)
+
+
+def ac_present(fd: int) -> bool | None:
+    got = feature(fd, STATUS_REPORT, 1)
+    if got is None:
+        return None
+    return bool(got[1] & 0x01)
+
+
+def _psu_watts() -> float | None:
+    """Real wall draw from the Corsair HX1200i, which exports hwmon."""
+    base = "/sys/class/hwmon"
+    try:
+        for node in os.listdir(base):
+            with open(f"{base}/{node}/name") as handle:
+                if handle.read().strip() != "corsairpsu":
+                    continue
+            with open(f"{base}/{node}/power1_input") as handle:
+                return int(handle.read().strip()) / 1e6
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _ups_detail(fd: int) -> str:
+    bits = []
+    battery = feature(fd, BATTERY_REPORT, 3)
+    if battery is not None:
+        runtime = int.from_bytes(battery[2:4], "little")
+        bits.append(f"battery {battery[1]}% runtime {runtime}s")
+    load = feature(fd, LOAD_REPORT, 1)
+    if load is not None:
+        bits.append(f"ups load {load[1]}%")
+    watts = _psu_watts()
+    if watts is not None:
+        bits.append(f"psu {watts:.0f}W")
+    return ", ".join(bits) if bits else "no telemetry"
+
+
+def set_limit(watts: int) -> bool:
+    watts = max(HARD_MIN, min(HARD_MAX, watts))
+    try:
+        done = subprocess.run(
+            ["/usr/bin/nvidia-smi", "-i", "0", "-pl", str(watts)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"FAILED to set {watts}W: {exc}")
+        return False
+    if done.returncode != 0:
+        log(f"FAILED to set {watts}W: {done.stderr.strip() or done.stdout.strip()}")
+        return False
+    log(f"power limit set to {watts}W")
+    return True
+
+
+def serve(path: str) -> None:
+    """Follow one UPS connection until it goes away."""
+    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        applied: bool | None = None
+        deadline = 0.0
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                state = ac_present(fd)
+                if state is None:
+                    raise OSError("UPS stopped answering feature reports")
+                if state is not applied:
+                    target = MAINS_WATTS if state else BATTERY_WATTS
+                    where = "MAINS" if state else "BATTERY"
+                    log(f"UPS on {where} -- {_ups_detail(fd)}")
+                    if set_limit(target):
+                        applied = state
+                deadline = now + RESYNC_INTERVAL
+
+            # The push report is the fast path; the timeout only bounds the
+            # resync above, so a lost event cannot strand the cap.
+            ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                continue
+            try:
+                data = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            if len(data) >= 2 and data[0] == STATUS_REPORT:
+                state = bool(data[1] & 0x01)
+                if state is not applied:
+                    target = MAINS_WATTS if state else BATTERY_WATTS
+                    where = "MAINS" if state else "BATTERY"
+                    log(f"UPS on {where} (pushed) -- {_ups_detail(fd)}")
+                    if set_limit(target):
+                        applied = state
+                    deadline = time.monotonic() + RESYNC_INTERVAL
+    finally:
+        os.close(fd)
+
+
+def check() -> int:
+    """Read and report, changing nothing. The diagnostic before arming."""
+    path = find_ups()
+    if path is None:
+        log(f"UPS {UPS_VID}:{UPS_PID}: NOT FOUND")
+        return 1
+    log(f"UPS {UPS_VID}:{UPS_PID} at {path}")
+    watts = _psu_watts()
+    log(f"psu total draw: {watts:.0f}W" if watts is not None else "psu total draw: unavailable")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as exc:
+        log(f"cannot open {path}: {exc} (needs root, or a udev rule for plugdev)")
+        return 1
+    try:
+        state = ac_present(fd)
+        log(f"mains present: {state}")
+        log(f"telemetry: {_ups_detail(fd)}")
+        log(f"would apply: {MAINS_WATTS if state else BATTERY_WATTS}W")
+    finally:
+        os.close(fd)
+    return 0
+
+
+def main() -> int:
+    if "--check" in sys.argv[1:]:
+        return check()
+    log(f"ups-gpu-power: mains={MAINS_WATTS}W battery={BATTERY_WATTS}W ceiling={HARD_MAX}W")
+    # Start low. Until the UPS has actually been read, the safe assumption is
+    # that we may already be on battery.
+    set_limit(BATTERY_WATTS)
+    while True:
+        path = find_ups()
+        if path is None:
+            log(f"UPS {UPS_VID}:{UPS_PID} not present; holding {BATTERY_WATTS}W")
+            set_limit(BATTERY_WATTS)
+            time.sleep(RECONNECT_DELAY)
+            continue
+        log(f"UPS at {path}")
+        try:
+            serve(path)
+        except OSError as exc:
+            log(f"UPS connection lost ({exc}); dropping to {BATTERY_WATTS}W")
+            set_limit(BATTERY_WATTS)
+            time.sleep(RECONNECT_DELAY)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
