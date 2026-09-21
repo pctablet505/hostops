@@ -29,8 +29,12 @@ strand the cap at 550 W while on battery.
 At 1800 W the UPS can *carry* the GPU at full tilt — the box draws ~310 W idle
 (measured from the PSU, below) and would reach perhaps 950 W with the GPU
 saturated. Nothing trips. What changes is **battery runtime**, which falls
-roughly as the inverse of load. The 550 → 200 W drop is the difference between
-riding out a flicker and dying mid-write.
+roughly as the inverse of load.
+
+Read off the UPS itself on 2026-09-21, idle: **battery 100%, runtime 1080 s
+(18 min) at 20% load (~310 W)**. A saturated GPU roughly triples that load, so
+the same battery gives well under 10 minutes — and the 550 → 200 W drop is
+most of the difference between riding out a flicker and dying mid-write.
 
 ## 550 W is a ceiling, not a preference
 

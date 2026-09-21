@@ -243,3 +243,32 @@ def test_serve_does_not_reapply_an_unchanged_state(mod, monkeypatch, calls):
     same = bytes([11, 0b0000_0011])
     applied = _drive(mod, monkeypatch, calls, [same, same, same], initial_ac=0b0000_0001)
     assert applied == [mod.MAINS_WATTS], "one apply, not four"
+
+
+def test_battery_telemetry_asks_for_the_size_the_device_answers(mod, monkeypatch):
+    """Report 8 carries FIVE payload bytes; asking for three returns EOVERFLOW.
+
+    FAIL-BEFORE: with BATTERY_REPORT_BYTES back at 3, the real device returns
+    errno 75 and `feature` returns None, so the battery percentage and runtime
+    vanish from every log line -- silently, because the line just gets shorter.
+    Observed on the CyberPower OLS2000EC on 2026-09-21.
+    """
+    seen = {}
+
+    def fake_feature(fd, rid, size):
+        seen[rid] = size
+        if rid == mod.BATTERY_REPORT:
+            if size < 5:
+                return None  # what the ioctl does: EOVERFLOW -> None
+            return bytes([rid, 100, 0x38, 0x04, 0x2C, 0x01])
+        if rid == mod.LOAD_REPORT:
+            return bytes([rid, 20])
+        return None
+
+    monkeypatch.setattr(mod, "feature", fake_feature)
+    monkeypatch.setattr(mod, "_psu_watts", lambda: 304.0)
+    detail = mod._ups_detail(-1)
+    assert seen[mod.BATTERY_REPORT] >= 5
+    assert "battery 100%" in detail
+    assert "runtime 1080s" in detail, "16-bit little-endian seconds"
+    assert "ups load 20%" in detail

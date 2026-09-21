@@ -48,11 +48,17 @@ HARD_MIN = 150
 UPS_VID, UPS_PID = "0764", "0601"
 
 #: Report 11 byte 0: bit0 ACPresent, bit1 Charging, bit2 Discharging.
-#: Report 8: capacity% then RunTimeToEmpty (16-bit LE seconds).
-#: Report 19: PercentLoad. All three decoded from the device's own report
-#: descriptor (world-readable at device/report_descriptor), not guessed.
+#: Report 8: capacity%, then RunTimeToEmpty (16-bit LE seconds), then one more
+#: 16-bit field -- FIVE payload bytes, not three. Asking for three returns
+#: EOVERFLOW ("Value too large for defined data type") and the whole battery
+#: line silently disappears from the log, which is how this was found: the
+#: descriptor walk that produced the offsets shares one bit counter between a
+#: report's Input and Feature fields, so its Feature offsets are wrong.
+#: Read back from the device on 2026-09-21: 100%, 1080 s at 20% load.
+#: Report 19: PercentLoad.
 STATUS_REPORT = 11
 BATTERY_REPORT = 8
+BATTERY_REPORT_BYTES = 5
 LOAD_REPORT = 19
 
 RECONNECT_DELAY = 5.0
@@ -122,7 +128,7 @@ def _psu_watts() -> float | None:
 
 def _ups_detail(fd: int) -> str:
     bits = []
-    battery = feature(fd, BATTERY_REPORT, 3)
+    battery = feature(fd, BATTERY_REPORT, BATTERY_REPORT_BYTES)
     if battery is not None:
         runtime = int.from_bytes(battery[2:4], "little")
         bits.append(f"battery {battery[1]}% runtime {runtime}s")
