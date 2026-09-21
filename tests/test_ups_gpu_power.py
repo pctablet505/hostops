@@ -153,3 +153,93 @@ def test_ac_present_is_unknown_when_the_ups_does_not_answer(mod, monkeypatch):
     """None, not False -- the caller must distinguish 'battery' from 'no idea'."""
     monkeypatch.setattr(mod, "feature", lambda fd, rid, size: None)
     assert mod.ac_present(-1) is None
+
+
+# ---------------------------------------------------------------------------
+# serve(): the pushed-report loop. Driven over a real pipe, so select/read and
+# the transition logic are exercised rather than assumed.
+# ---------------------------------------------------------------------------
+
+
+def _drive(mod, monkeypatch, calls, frames, initial_ac):
+    """Run serve() over a real select()able fd, one HID report per read.
+
+    The pipe supplies genuine readiness so select() is exercised, but reads are
+    served one frame at a time: a pipe is a byte stream and would hand back two
+    concatenated reports in a single read, which hidraw never does -- it
+    returns exactly one report per read. Modelling the stream faithfully would
+    test the harness, not the daemon. Frames exhausted -> b"" -> the EOF path.
+    """
+    import os as _os
+    from collections import deque
+
+    read_fd, write_fd = _os.pipe()
+    _os.write(write_fd, b"\x00" * len(frames) if frames else b"\x00")
+    _os.close(write_fd)
+    pending = deque(frames)
+
+    monkeypatch.setattr(mod.os, "open", lambda *a, **k: read_fd)
+    monkeypatch.setattr(mod.os, "close", lambda fd: None)
+    # Reads past exhaustion return EOF. A daemon that does not treat EOF as a
+    # lost connection spins here forever (select reports a closed descriptor
+    # readable indefinitely), so the harness turns that hang into a failure
+    # rather than letting the suite stall.
+    spins = []
+
+    def _read(fd, n):
+        if pending:
+            return pending.popleft()
+        spins.append(1)
+        assert len(spins) < 5, "serve() ignored EOF and is spinning on a dead descriptor"
+        return b""
+
+    monkeypatch.setattr(mod.os, "read", _read)
+    monkeypatch.setattr(mod, "feature", lambda fd, rid, size: bytes([rid, initial_ac]))
+    monkeypatch.setattr(mod, "log", lambda *_: None)
+    try:
+        # AssertionError is an OSError-sibling here only via the spin guard;
+        # keep them distinct so a spin reports as a spin.
+        with pytest.raises(OSError):
+            mod.serve("/dev/hidraw-test")
+    finally:
+        _os.close(read_fd)
+    return [_watts(c) for c in calls]
+
+
+def test_serve_drops_the_cap_on_a_pushed_transfer_to_battery(mod, monkeypatch, calls):
+    """The whole reason this is a daemon: the cut arrives as a pushed report."""
+    # Start on mains (bit 0 set), then the UPS pushes ACPresent=0, Discharging=1.
+    applied = _drive(mod, monkeypatch, calls, [bytes([11, 0b0000_0100])], initial_ac=0b0000_0001)
+    assert applied[0] == mod.MAINS_WATTS, "the initial feature read must settle on mains"
+    assert mod.BATTERY_WATTS in applied, "the pushed transfer must drop the cap"
+    assert applied[-1] == mod.BATTERY_WATTS
+
+
+def test_serve_restores_the_cap_when_mains_returns(mod, monkeypatch, calls):
+    applied = _drive(
+        mod,
+        monkeypatch,
+        calls,
+        [bytes([11, 0b0000_0100]), bytes([11, 0b0000_0011])],
+        initial_ac=0b0000_0001,
+    )
+    assert applied[-1] == mod.MAINS_WATTS
+
+
+def test_serve_ignores_reports_that_are_not_the_status_report(mod, monkeypatch, calls):
+    """Report 8 (capacity) and 19 (load) also arrive; neither may move the cap."""
+    applied = _drive(
+        mod,
+        monkeypatch,
+        calls,
+        [bytes([8, 55, 0x10, 0x0E]), bytes([19, 42])],
+        initial_ac=0b0000_0001,
+    )
+    assert set(applied) == {mod.MAINS_WATTS}, "only report 11 carries mains state"
+
+
+def test_serve_does_not_reapply_an_unchanged_state(mod, monkeypatch, calls):
+    """A repeated report must not re-run nvidia-smi on every push."""
+    same = bytes([11, 0b0000_0011])
+    applied = _drive(mod, monkeypatch, calls, [same, same, same], initial_ac=0b0000_0001)
+    assert applied == [mod.MAINS_WATTS], "one apply, not four"

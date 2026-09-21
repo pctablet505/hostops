@@ -183,6 +183,12 @@ def serve(path: str) -> None:
                 data = os.read(fd, 64)
             except BlockingIOError:
                 continue
+            if not data:
+                # EOF. select() reports a closed descriptor as readable
+                # forever, so without this the loop spins at 100% CPU and
+                # never reconnects -- holding whatever cap was last applied,
+                # which may be 550 W with the UPS already gone.
+                raise OSError("UPS closed the connection")
             if len(data) >= 2 and data[0] == STATUS_REPORT:
                 state = bool(data[1] & 0x01)
                 if state is not applied:
