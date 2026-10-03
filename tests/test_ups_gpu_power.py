@@ -121,8 +121,36 @@ def test_failed_nvidia_smi_is_reported_not_swallowed(mod, monkeypatch):
 
 
 def test_ups_is_resolved_by_vid_pid_on_this_box(mod):
-    """Integration: the real device must be found, not a hardcoded hidrawN."""
-    assert mod.find_ups() == "/dev/hidraw4"
+    """Integration: the real device must be found by vendor/product, not by a hidrawN.
+
+    The node moves: hidraw4 until 2026-09-30, hidraw0 since, so the number is not asserted.
+    """
+    path = mod.find_ups()
+    assert path is not None and path.startswith("/dev/hidraw")
+    uevent = Path(f"/sys/class/hidraw/{Path(path).name}/device/uevent").read_text().upper()
+    assert f"HID_ID=0003:0000{mod.UPS_VID.upper()}:0000{mod.UPS_PID.upper()}" in uevent
+
+
+def test_find_ups_matches_vid_pid_not_position(mod, monkeypatch):
+    """The test above cannot tell a matcher from "the first hidraw" while the UPS is the
+    first node (it is, now), so check the matching on a fake sysfs where it is not."""
+    import io
+    import os
+
+    tree = {
+        "/sys/class/hidraw/hidraw0/device/uevent": "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C548\n",
+        "/sys/class/hidraw/hidraw3/device/uevent": "DRIVER=hid-generic\nHID_ID=0003:00000764:00000601\n",
+    }
+    real_listdir = os.listdir
+
+    def listdir(path):
+        if str(path) == "/sys/class/hidraw":
+            return sorted({p.split("/")[4] for p in tree})
+        return real_listdir(path)
+
+    monkeypatch.setattr(mod.os, "listdir", listdir)
+    monkeypatch.setitem(mod.__dict__, "open", lambda path, *a, **k: io.StringIO(tree[path]))
+    assert mod.find_ups() == "/dev/hidraw3"
 
 
 def test_psu_wall_draw_is_readable_without_privileges(mod):
