@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Keep a record of UPS outages and power draw, and answer questions about it.
+
+    power-ledger run                  the service (started by systemd)
+    power-ledger status               latest row and its age; exit 2 when stale
+    power-ledger tail [-n 20]         the last rows
+    power-ledger outages [--days 30]  battery episodes, derived from the rows
+    power-ledger energy [--days 7]    kWh of PSU DC output per day
+
+WHAT IT RECORDS
+---------------
+One SQLite file. A row every 60 s on mains and every 5 s on battery, and an
+extra row the moment the UPS's status byte changes. The UPS pushes its status
+(report 0x0b) and battery (report 0x08) reports every ~2 s unasked, so outage,
+charge and runtime need no requests; the only requests are three feature reads
+per periodic row (load, input volts, battery volts). Everything stored is a raw
+integer in the device's own units; outages, durations and energy are queries.
+
+It NEVER writes to the UPS. The node is opened read-only and the only ioctl is
+HIDIOCGFEATURE. tests/test_power_ledger.py fails if that stops being true.
+ups-gpu-power, which protects the GPU, is a separate unit this one never
+touches, and the UPS gives each opener of the node its own copy of the reports.
+
+Units: vin and vbat are tenths of a volt; psu_w is the PSU's DC output, not wall
+draw; the status byte f0b is kept raw because only bit 0 (mains present) is
+proven.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import os
+import pathlib
+import select
+import signal
+import sqlite3
+import sys
+import time
+
+DB_PATH = "/var/lib/power-ledger/ledger.db"
+UPS_VID, UPS_PID = "0764", "0601"
+
+STATUS_REPORT, BATTERY_REPORT = 0x0B, 0x08  # pushed by the UPS every ~2 s, alternating
+LOAD_REPORT, VIN_REPORT, VBAT_REPORT = 0x13, 0x0F, 0x0A  # the only periodic GETs
+
+MAINS_INTERVAL, BATTERY_INTERVAL = 60.0, 5.0
+#: No 0x0b push for this long -> read 0x0b and 0x08 directly on the next periodic row.
+PUSH_STALE = 30.0
+#: Rate limit for status-change rows whose bit 0 did not change.
+FLAG_ROW_MIN_GAP = 60.0
+#: Outage/energy derivation: rows further apart than this are a gap, not a quiet UPS.
+GAP_SECONDS = 180
+#: `status` exits 2 above this age.
+STALE_SECONDS = 180
+RECONNECT_DELAY = 5.0
+SCHEMA_VERSION = 1
+#: A repeated complaint (sqlite error, same loss reason) is logged at most this often.
+COMPLAINT_INTERVAL = 600.0
+
+SAMPLE_COLUMNS = (
+    "ts", "kind", "mains", "f0b", "charge", "runtime", "load", "vin", "vbat",
+    "psu_w", "gpu_w", "gpu_limit_w",
+)
+
+DDL = """
+CREATE TABLE IF NOT EXISTS samples (
+  ts INTEGER NOT NULL,      -- unix seconds, wall clock (time.time())
+  kind INTEGER NOT NULL,    -- 0 periodic, 1 status change
+  mains INTEGER,            -- f0b & 1
+  f0b INTEGER,              -- raw status byte, report 0x0b
+  charge INTEGER,           -- %   (0x08 byte 1)
+  runtime INTEGER,          -- s   (0x08 bytes 2-3)
+  load INTEGER,             -- %   (0x13); NULL on kind=1
+  vin INTEGER,              -- V x10 (0x0f); NULL on kind=1
+  vbat INTEGER,             -- V x10 (0x0a); NULL on kind=1
+  psu_w INTEGER,            -- W, PSU DC output
+  gpu_w INTEGER,            -- W, NVML power usage
+  gpu_limit_w INTEGER       -- W, NVML power management limit
+);
+CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
+CREATE TABLE IF NOT EXISTS marks (ts INTEGER NOT NULL, what TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+_complained: dict[str, float] = {}
+
+
+def _may_complain(key: str) -> bool:
+    """True at most once per COMPLAINT_INTERVAL for each key."""
+    now = time.monotonic()
+    if now - _complained.get(key, float("-inf")) < COMPLAINT_INTERVAL:
+        return False
+    _complained[key] = now
+    return True
+
+
+# --------------------------------------------------------------------- device
+
+
+def _hidiocgfeature(size: int) -> int:
+    """_IOC(READ|WRITE, 'H', 0x07, size) -- the HIDIOCGFEATURE ioctl. GET only."""
+    return 0xC0000000 | (size << 16) | (0x48 << 8) | 0x07
+
+
+def feature(fd: int, report_id: int, size: int) -> bytes | None:
+    """Payload of a GET_FEATURE read, or None on error or a short reply."""
+    buf = bytearray(size + 1)
+    buf[0] = report_id
+    try:
+        n = fcntl.ioctl(fd, _hidiocgfeature(len(buf)), buf, True)
+    except OSError:
+        return None
+    # The daemon ignores n; a reply shorter than asked is not a value.
+    return bytes(buf[1 : size + 1]) if n >= size + 1 else None
+
+
+def find_ups() -> str | None:
+    """Resolve the UPS by vendor/product, never by a hidrawN that can shift."""
+    base = "/sys/class/hidraw"
+    try:
+        nodes = sorted(os.listdir(base))
+    except OSError:
+        return None
+    for node in nodes:
+        try:
+            with open(f"{base}/{node}/device/uevent") as handle:
+                uevent = handle.read()
+        except OSError:
+            continue
+        if f"HID_ID=0003:0000{UPS_VID.upper()}:0000{UPS_PID.upper()}" in uevent.upper():
+            return f"/dev/{node}"
+    return None
+
+
+def _open(path: str) -> int:
+    # Read-only on purpose: nothing in this file writes to the UPS.
+    return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+
+
+def _hid_name(path: str) -> str | None:
+    try:
+        with open(f"/sys/class/hidraw/{os.path.basename(path)}/device/uevent") as handle:
+            for line in handle:
+                if line.startswith("HID_NAME="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def psu_watts() -> int | None:
+    """PSU DC output from the Corsair's hwmon, found by name: the index moves."""
+    base = "/sys/class/hwmon"
+    try:
+        nodes = sorted(os.listdir(base))
+    except OSError:
+        return None
+    for node in nodes:
+        # Per node: one hwmon without a `name` file must not hide the PSU behind it.
+        try:
+            with open(f"{base}/{node}/name") as handle:
+                if handle.read().strip() != "corsairpsu":
+                    continue
+            with open(f"{base}/{node}/power1_input") as handle:
+                return round(int(handle.read().strip()) / 1e6)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as handle:
+            return handle.read().strip()
+    except OSError:
+        return "unknown"
+
+
+class Nvml:
+    """GPU power through NVML, loaded lazily. Every failure is (None, None)."""
+
+    def __init__(self) -> None:
+        self.lib = None
+        self.handle = None
+        self.ok: bool | None = None
+
+    def _open(self) -> None:
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+        self._check(lib.nvmlInit_v2(), "nvmlInit_v2")
+        handle = ctypes.c_void_p()
+        self._check(lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)), "nvmlDeviceGetHandleByIndex_v2")
+        self.lib, self.handle = lib, handle
+
+    @staticmethod
+    def _check(code: int, name: str) -> None:
+        if code != 0:
+            raise OSError(f"{name} returned {code}")
+
+    def _milliwatts(self, name: str) -> int:
+        value = ctypes.c_uint()
+        self._check(getattr(self.lib, name)(self.handle, ctypes.byref(value)), name)
+        return value.value
+
+    def _drop(self) -> None:
+        if self.lib is not None:
+            try:
+                self.lib.nvmlShutdown()
+            except (OSError, AttributeError):
+                pass
+        self.lib = self.handle = None
+
+    def read(self) -> tuple[int | None, int | None]:
+        try:
+            if self.lib is None:
+                self._open()
+            power = round(self._milliwatts("nvmlDeviceGetPowerUsage") / 1000)
+            limit = round(self._milliwatts("nvmlDeviceGetPowerManagementLimit") / 1000)
+        except (OSError, AttributeError) as exc:
+            self._drop()
+            if self.ok is not False:
+                log(f"NVML unavailable: {exc}")
+            self.ok = False
+            return None, None
+        if self.ok is not True:
+            log("NVML available")
+        self.ok = True
+        return power, limit
+
+
+# ---------------------------------------------------------------------- store
+
+
+class Store:
+    """The writer. Plain INSERTs into a rowid table: a clock that steps back
+    must never overwrite history, so ts is not a key."""
+
+    def __init__(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.db = sqlite3.connect(path, timeout=5, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        # Does not persist across opens. FULL: a hard power cut must not lose the
+        # tail of an outage, which is the case this log exists for.
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA busy_timeout=5000")
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0:
+            self.db.executescript(f"BEGIN;{DDL}PRAGMA user_version={SCHEMA_VERSION};COMMIT;")
+        elif version != SCHEMA_VERSION:
+            raise SystemExit(f"power-ledger: schema version {version} unknown; refusing to write")
+        self.dropped = 0
+
+    def add(self, row: dict) -> None:
+        marks = ",".join("?" * len(SAMPLE_COLUMNS))
+        self.db.execute(
+            f"INSERT INTO samples ({','.join(SAMPLE_COLUMNS)}) VALUES ({marks})",
+            [row.get(column) for column in SAMPLE_COLUMNS],
+        )
+
+    def mark(self, what: str) -> None:
+        self.db.execute("INSERT INTO marks VALUES (?, ?)", (int(time.time()), what))
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+
+    def safe(self, fn, *args) -> bool:
+        """Run a write; a failed one is counted and skipped, never fatal."""
+        try:
+            fn(*args)
+            return True
+        except sqlite3.Error as exc:
+            self.dropped += 1
+            if _may_complain("sqlite"):
+                log(f"sqlite error, {self.dropped} write(s) dropped so far: {exc}")
+            return False
+
+
+def open_ro(path: str) -> sqlite3.Connection:
+    """Reader for the CLI. Plain mode=ro, never immutable=1: immutable ignores the
+    WAL, so a live database would show none of the rows not yet checkpointed."""
+    if not os.path.exists(path):
+        print(f"power-ledger: no database at {path}", file=sys.stderr)
+        raise SystemExit(1)
+    uri = pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+    try:
+        return sqlite3.connect(uri, uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        print(f"power-ledger: cannot open {path}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+# --------------------------------------------------------------------- ledger
+
+
+class Ledger:
+    """What the service knows about the UPS. No I/O: the caller passes the times."""
+
+    def __init__(self) -> None:
+        self.f0b: int | None = None
+        self.charge: int | None = None
+        self.runtime: int | None = None
+        self.last_status_mono: float | None = None
+        self.deadline = 0.0
+        self.last_flag_row_mono = float("-inf")
+
+    def on_report(self, data: bytes, mono: float) -> bool:
+        """Apply one pushed report. True means: write a status-change row now."""
+        if data[:1] == bytes([BATTERY_REPORT]) and len(data) >= 6:
+            self.charge = data[1]
+            self.runtime = data[2] | data[3] << 8
+            return False
+        if data[:1] != bytes([STATUS_REPORT]) or len(data) < 2:
+            return False
+        old, new = self.f0b, data[1]
+        self.f0b = new
+        self.last_status_mono = mono
+        if old is None or new == old:
+            return False
+        if (new ^ old) & 1:
+            if not new & 1:
+                self.deadline = min(self.deadline, mono + BATTERY_INTERVAL)
+            return True
+        # Another bit moved. Its meaning is unknown, so do not let it flood the log.
+        if mono - self.last_flag_row_mono >= FLAG_ROW_MIN_GAP:
+            self.last_flag_row_mono = mono
+            return True
+        return False
+
+    def interval(self) -> float:
+        # An unknown state gets the dense cadence.
+        return MAINS_INTERVAL if self.f0b is not None and self.f0b & 1 else BATTERY_INTERVAL
+
+    def due(self, mono: float) -> bool:
+        return mono >= self.deadline
+
+    def periodic_done(self, mono: float) -> None:
+        self.deadline = mono + self.interval()
+
+    def push_stale(self, mono: float) -> bool:
+        return self.last_status_mono is None or mono - self.last_status_mono > PUSH_STALE
+
+    def row(self, kind: int, wall: float, load=None, vin=None, vbat=None, psu=None, gpu=(None, None)) -> dict:
+        return {
+            "ts": int(wall), "kind": kind,
+            "mains": None if self.f0b is None else self.f0b & 1,
+            "f0b": self.f0b, "charge": self.charge, "runtime": self.runtime,
+            "load": load, "vin": vin, "vbat": vbat,
+            "psu_w": psu, "gpu_w": gpu[0], "gpu_limit_w": gpu[1],
+        }
+
+
+# -------------------------------------------------------------------- service
+
+
+def _le(payload: bytes | None) -> int | None:
+    return None if payload is None else int.from_bytes(payload, "little")
+
+
+def _seed(fd: int, led: Ledger, mono: float) -> None:
+    """Read the status and battery reports directly (start-up, or pushes stopped)."""
+    status = feature(fd, STATUS_REPORT, 1)
+    if status is None:
+        raise OSError("UPS did not answer GET 0x0b")
+    led.on_report(bytes([STATUS_REPORT]) + status, mono)
+    battery = feature(fd, BATTERY_REPORT, 5)
+    if battery is not None:
+        led.on_report(bytes([BATTERY_REPORT]) + battery, mono)
+
+
+def serve(path: str, store: Store, nvml: Nvml) -> None:
+    """Follow one UPS connection until it goes away."""
+    fd = _open(path)
+    try:
+        led = Ledger()
+        _seed(fd, led, time.monotonic())
+        store.safe(store.mark, f"ups-found {os.path.basename(path)}")
+        model = _hid_name(path)
+        if model:
+            store.safe(store.set_meta, "model", model)
+        polling = False
+        while True:
+            mono = time.monotonic()
+            if led.due(mono):
+                if led.push_stale(mono):
+                    if not polling and _may_complain("polling"):
+                        log("UPS pushes stopped; polling")
+                    polling = True
+                    _seed(fd, led, mono)
+                else:
+                    polling = False
+                row = led.row(
+                    0, time.time(),
+                    load=_le(feature(fd, LOAD_REPORT, 1)),
+                    vin=_le(feature(fd, VIN_REPORT, 2)),
+                    vbat=_le(feature(fd, VBAT_REPORT, 2)),
+                    psu=psu_watts(), gpu=nvml.read(),
+                )
+                store.safe(store.add, row)
+                led.periodic_done(mono)
+            ready, _, _ = select.select([fd], [], [], max(0.0, led.deadline - time.monotonic()))
+            if not ready:
+                continue
+            try:
+                data = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            if not data:
+                # EOF: select() reports a closed descriptor readable forever, which
+                # would spin the CPU. Treat it as a lost device.
+                raise OSError("UPS closed the connection")
+            if led.on_report(data, time.monotonic()):
+                # No feature reads here: the daemon's own push path is making its
+                # requests at this exact moment.
+                store.safe(store.add, led.row(1, time.time(), psu=psu_watts(), gpu=nvml.read()))
+    finally:
+        os.close(fd)
+
+
+def _terminate(*_args) -> None:
+    sys.exit(0)
+
+
+def run(db: str) -> int:
+    store = Store(db)
+    nvml = Nvml()
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+    store.safe(store.mark, f"start boot={boot_id()} pid={os.getpid()} schema={SCHEMA_VERSION}")
+    log(f"logging to {db}")
+    try:
+        while True:
+            path = find_ups()
+            if path is None:
+                time.sleep(RECONNECT_DELAY)
+                continue
+            try:
+                serve(path, store, nvml)
+            except OSError as exc:
+                # A device that fails the same way every 5 s is one event, not thousands.
+                if _may_complain(f"lost:{exc}"):
+                    log(f"lost {path}: {exc}")
+                    store.safe(store.mark, f"ups-lost {exc}")
+                time.sleep(RECONNECT_DELAY)
+    finally:
+        store.safe(store.mark, "stop")
+
+
+# ------------------------------------------------------------------- deriving
+
+
+def hms(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def stamp(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _trapezoid_wh(points: list[tuple[int, int | None]]) -> tuple[float, int, bool]:
+    """(Wh, segments used, partial) over consecutive (ts, watts) points."""
+    wh, used, partial = 0.0, 0, False
+    for (t1, p1), (t2, p2) in zip(points, points[1:]):
+        if p1 is None or p2 is None:
+            partial = True
+            continue
+        wh += (t2 - t1) * (p1 + p2) / 2 / 3600
+        used += 1
+    return wh, used, partial
+
+
+def derive_outages(rows: list[tuple], marks: list[tuple], now: float) -> list[dict]:
+    """Battery episodes.
+
+    rows:  (ts, rowid, mains, charge, runtime, load, psu_w), in the window.
+    marks: (ts, what), in the window.
+
+    An episode opens at the first row with mains=0 and closes at the next row
+    with mains=1. It also closes, with an unknown end, at any start/stop/
+    ups-lost mark and at any gap over GAP_SECONDS: pairing across a shutdown
+    would invent a multi-hour outage.
+    """
+    stream = []
+    for ts, what in marks:
+        word = what.split(" ", 1)[0]
+        if word in ("start", "stop", "ups-lost"):
+            stream.append(((ts, 0 if word == "start" else 2, 0), "mark", ts, word))
+    for row in rows:
+        stream.append(((row[0], 1, row[1]), "row", row[0], row))
+    stream.sort(key=lambda item: item[0])
+
+    episodes: list[dict] = []
+    cur: dict | None = None
+    prev: tuple[int, int] | None = None  # (ts, mains) of the previous accepted row
+    last_ts: int | None = None
+
+    def finish(end_note: str | None = None, end: int | None = None, charge_end=None) -> None:
+        nonlocal cur
+        cur["end"], cur["end_note"] = end, end_note
+        cur["charge_end"] = charge_end if charge_end is not None else cur["last_charge"]
+        episodes.append(cur)
+        cur = None
+
+    for _key, kind, ts, payload in stream:
+        if kind == "mark":
+            if cur is not None:
+                finish(f"logger {payload} {hms(ts)}")
+            prev = None
+            continue
+        _ts, _rowid, mains, charge, runtime, load, psu = payload
+        if mains is None:
+            continue
+        if cur is not None and prev is not None and ts - prev[0] > GAP_SECONDS:
+            finish(f"gap from {hms(prev[0])}")
+            prev = None
+        last_ts = ts
+        if mains == 0:
+            if cur is None:
+                cur = {
+                    # Exact only if the row before it was on mains and close by: a
+                    # stalled logger leaves a hole that no mark explains.
+                    "start": ts, "start_known": prev is not None and prev[1] == 1 and ts - prev[0] <= GAP_SECONDS,
+                    "first_row": ts, "charge_start": charge, "last_charge": charge,
+                    "min_runtime": None, "max_load": None, "last_batt_ts": ts, "points": [],
+                }
+            cur["last_batt_ts"], cur["last_charge"] = ts, charge
+            if runtime is not None:
+                cur["min_runtime"] = runtime if cur["min_runtime"] is None else min(cur["min_runtime"], runtime)
+            if load is not None:
+                cur["max_load"] = load if cur["max_load"] is None else max(cur["max_load"], load)
+            cur["points"].append((ts, psu))
+        elif cur is not None:
+            cur["points"].append((ts, psu))
+            finish(end=ts, charge_end=charge)
+        prev = (ts, mains)
+
+    if cur is not None:
+        if last_ts is not None and now - last_ts <= GAP_SECONDS:
+            cur["end"], cur["end_note"], cur["charge_end"] = None, "ongoing", cur["last_charge"]
+            episodes.append(cur)
+        else:
+            finish(f"no rows since {hms(last_ts)}" if last_ts is not None else "no rows")
+
+    for ep in episodes:
+        ep["wh"], used, ep["partial"] = _trapezoid_wh(ep.pop("points"))
+        ep["wh"] = ep["wh"] if used else None
+        if ep["end"] is not None and ep["start_known"]:
+            ep["duration"], ep["exact"] = ep["end"] - ep["start"], True
+        else:
+            ep["duration"], ep["exact"] = ep["last_batt_ts"] - ep["start"], False
+    return episodes
+
+
+def format_outage(ep: dict) -> str:
+    start = stamp(ep["start"]) if ep["start_known"] else f"start unknown (first row {hms(ep['first_row'])})"
+    if ep["end"] is not None:
+        same_day = stamp(ep["end"])[:10] == stamp(ep["start"])[:10]
+        end = f"end {hms(ep['end']) if same_day else stamp(ep['end'])}"
+    elif ep["end_note"] == "ongoing":
+        end = "ongoing"
+    else:
+        end = f"end unknown ({ep['end_note']})"
+    duration = f"{ep['duration']}s" if ep["exact"] else f">={ep['duration']}s"
+    charge = f"{ep['charge_start'] if ep['charge_start'] is not None else '-'}->{ep['charge_end'] if ep['charge_end'] is not None else '-'}%"
+    runtime = "-" if ep["min_runtime"] is None else f"{ep['min_runtime']}s"
+    load = "-" if ep["max_load"] is None else f"{ep['max_load']}%"
+    wh = "- Wh" if ep["wh"] is None else f"{ep['wh']:.1f} Wh (PSU DC)" + (" partial" if ep["partial"] else "")
+    return f"{start}  {end}  {duration}  charge {charge}  min rt {runtime}  peak load {load}  {wh}"
+
+
+def energy_by_day(rows: list[tuple], since: float, now: float) -> list[tuple[str, float, float]]:
+    """(day, Wh, coverage 0..1) of PSU DC output, local days, oldest first.
+
+    rows: (ts, psu_w) in the window, ordered by (ts, rowid). A segment counts only
+    when both ends have a reading and the rows are at most GAP_SECONDS apart; it
+    belongs to the day of its first row. Coverage is the integrated seconds over
+    the part of that day inside the window (from the first row, up to now).
+    """
+    first_ts = rows[0][0] if rows else since
+    window_start = max(since, first_ts)
+    wh_by_day: dict[str, float] = {}
+    secs_by_day: dict[str, int] = {}
+    for (t1, p1), (t2, p2) in zip(rows, rows[1:]):
+        if p1 is None or p2 is None or not 0 < t2 - t1 <= GAP_SECONDS:
+            continue
+        day = time.strftime("%Y-%m-%d", time.localtime(t1))
+        wh_by_day[day] = wh_by_day.get(day, 0.0) + (t2 - t1) * (p1 + p2) / 2 / 3600
+        secs_by_day[day] = secs_by_day.get(day, 0) + (t2 - t1)
+    out = []
+    for day in sorted(wh_by_day):
+        y, m, d = (int(x) for x in day.split("-"))
+        day_start = time.mktime((y, m, d, 0, 0, 0, 0, 0, -1))
+        day_end = time.mktime((y, m, d + 1, 0, 0, 0, 0, 0, -1))
+        span = max(1.0, min(day_end, now) - max(day_start, window_start))
+        out.append((day, wh_by_day[day], min(1.0, secs_by_day[day] / span)))
+    return out
+
+
+# ------------------------------------------------------------------------ CLI
+
+
+def fmt_row(r: dict) -> str:
+    def val(x, fmt="{}"):
+        return "-" if x is None else fmt.format(x)
+
+    mains = "?" if r["mains"] is None else ("mains" if r["mains"] else "BATT")
+    f0b = "-" if r["f0b"] is None else f"{r['f0b']:#04x}"
+    vin = "-" if r["vin"] is None else f"{r['vin'] / 10:.1f}V"
+    vbat = "-" if r["vbat"] is None else f"{r['vbat'] / 10:.1f}V"
+    return (
+        f"{stamp(r['ts'])} {'C' if r['kind'] else 'P'} {mains} f0b={f0b} {val(r['charge'], '{}%')} "
+        f"rt={val(r['runtime'], '{}s')} load={val(r['load'], '{}%')} vin={vin} vbat={vbat} "
+        f"psu={val(r['psu_w'], '{}W')} gpu={val(r['gpu_w'])}/{val(r['gpu_limit_w'])}W"
+    )
+
+
+def _rows_as_dicts(cursor) -> list[dict]:
+    return [dict(zip(SAMPLE_COLUMNS, r)) for r in cursor.fetchall()]
+
+
+_SELECT = f"SELECT {','.join(SAMPLE_COLUMNS)} FROM samples"
+
+
+def cmd_status(args) -> int:
+    db = open_ro(args.db)
+    rows = _rows_as_dicts(db.execute(f"{_SELECT} ORDER BY rowid DESC LIMIT 1"))
+    if not rows:
+        print("power-ledger: no rows yet")
+        return 1
+    age = int(time.time()) - rows[0]["ts"]
+    print(fmt_row(rows[0]))
+    stale = age > STALE_SECONDS
+    print(f"age {age}s" + (f"  STALE: no row for >{STALE_SECONDS}s" if stale else ""))
+    return 2 if stale else 0
+
+
+def cmd_tail(args) -> int:
+    db = open_ro(args.db)
+    for r in reversed(_rows_as_dicts(db.execute(f"{_SELECT} ORDER BY rowid DESC LIMIT ?", (args.n,)))):
+        print(fmt_row(r))
+    return 0
+
+
+def cmd_outages(args) -> int:
+    db = open_ro(args.db)
+    now = time.time()
+    since = int(now - args.days * 86400)
+    rows = db.execute(
+        "SELECT ts, rowid, mains, charge, runtime, load, psu_w FROM samples WHERE ts >= ? ORDER BY ts, rowid", (since,)
+    ).fetchall()
+    marks = db.execute("SELECT ts, what FROM marks WHERE ts >= ? ORDER BY ts, rowid", (since,)).fetchall()
+    print("times are +-4 s (UPS status report period); outages shorter than ~4 s may be missing")
+    episodes = derive_outages(rows, marks, now)
+    if not episodes:
+        print(f"no battery episodes in the last {args.days:g} days")
+    for ep in episodes:
+        print(format_outage(ep))
+    return 0
+
+
+def cmd_energy(args) -> int:
+    db = open_ro(args.db)
+    now = time.time()
+    since = int(now - args.days * 86400)
+    rows = db.execute("SELECT ts, psu_w FROM samples WHERE ts >= ? ORDER BY ts, rowid", (since,)).fetchall()
+    days = energy_by_day(rows, since, now)
+    if not days:
+        print(f"no PSU readings in the last {args.days:g} days")
+        return 0
+    for day, wh, cover in days:
+        print(f"{day}  {wh / 1000:.2f} kWh  coverage {100 * cover:.1f}%")
+    total = sum(wh for _, wh, _ in days)
+    print(f"total       {total / 1000:.2f} kWh")
+    print("PSU DC output; wall draw is higher by PSU losses")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", default=DB_PATH, help=f"database path (default {DB_PATH})")
+    parser = argparse.ArgumentParser(prog="power-ledger", description="UPS outage and power-draw record.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run", parents=[common], help="run the service")
+    sub.add_parser("status", parents=[common], help="latest row and its age; exit 2 when stale")
+    p = sub.add_parser("tail", parents=[common], help="the last rows")
+    p.add_argument("-n", type=int, default=20)
+    p = sub.add_parser("outages", parents=[common], help="battery episodes")
+    p.add_argument("--days", type=float, default=30)
+    p = sub.add_parser("energy", parents=[common], help="kWh of PSU DC output per day")
+    p.add_argument("--days", type=float, default=7)
+    args = parser.parse_args(argv)
+    if args.cmd == "run":
+        return run(args.db)
+    return {"status": cmd_status, "tail": cmd_tail, "outages": cmd_outages, "energy": cmd_energy}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

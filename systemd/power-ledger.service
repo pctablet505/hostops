@@ -1,0 +1,40 @@
+[Unit]
+# Logs UPS, PSU and GPU power readings to SQLite. Read-only towards the UPS: it opens the
+# hidraw node O_RDONLY and only issues GET_FEATURE. Independent of ups-gpu-power by design:
+# no Requires/Wants/BindsTo on it, so this unit can never stop or restart the daemon.
+Description=Power ledger: UPS, PSU and GPU power log
+Documentation=file:/home/pctablet505/Projects/hostops/docs/UPS-GPU-POWER.md
+After=ups-gpu-power.service nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/power-ledger run
+# Owner account: plugdev opens the UPS node (udev rule 99-cyberpower-ups.rules), and the
+# CLI user owning the DB keeps WAL's -shm writable for readers.
+User=pctablet505
+Group=pctablet505
+SupplementaryGroups=plugdev
+StateDirectory=power-ledger
+StateDirectoryMode=0755
+Restart=always
+# 30 s keeps 5 failures outside StartLimitIntervalSec=10s, so a persistent fault retries for ever.
+RestartSec=30
+Nice=10
+# Same hardening as ups-gpu-power.service, which runs Python + hidraw ioctls under it:
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Deliberately omitted (unverified for ctypes+NVML or a no-op here): MemoryDenyWriteExecute,
+# PrivateDevices/DeviceAllow (would block /dev/hidraw* and /dev/nvidia*), IOSchedulingClass
+# (NVMe scheduler is none), MemoryMax/CPUQuota (unmeasured under systemd; RSS 34 MB outside).
+
+[Install]
+WantedBy=multi-user.target

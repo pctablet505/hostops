@@ -44,17 +44,21 @@ most of the difference between riding out a flicker and dying mid-write.
 recovered it. 550 W itself ran ~1.5 h clean under saturation stress, so the
 mains figure sits inside measured-good territory and 600 W stays out of reach.
 
-## Free instrumentation: the PSU already reports wall draw
+## Free instrumentation: the PSU already reports its own power
 
 The **Corsair HX1200i** binds the in-kernel `corsair-psu` driver and exports
 hwmon, readable with no privileges at all:
 
 ```bash
-cat /sys/class/hwmon/hwmon3/power1_input   # microwatts, total system draw
+cat /sys/class/hwmon/hwmon3/power1_input   # microwatts, PSU DC output (sum of the rails), not wall draw
 ```
 
-The daemon logs this on every transition. It is also the continuous power
-record the box has never had — the 2026-09-11 Xid was diagnosed without one.
+Measured 2026-10-03: `power1` read 476 W while the rails summed to 471.5 W, so
+wall draw is higher by the PSU's losses. The hwmon index is not stable; find
+the node by `name` = `corsairpsu`.
+
+The daemon logs this on every transition, and `power-ledger` (below) records
+it continuously — the 2026-09-11 Xid was diagnosed without such a record.
 
 ## Install
 
@@ -64,7 +68,9 @@ sudo /home/pctablet505/Projects/hostops/install.sh
 
 It installs the binary, the unit and the udev rule, disables the old
 fixed-375 W `nvidia-power-limit.service` (two units writing one limit race at
-boot), starts the daemon and prints the resulting limit.
+boot), starts the daemon and prints the resulting limit. It also installs
+`power-ledger`. `install.sh ups-gpu-power` or `install.sh power-ledger`
+installs just one.
 
 ## Verify, any time, without sudo
 
@@ -80,3 +86,21 @@ draw, and the cap it would apply. Changes nothing.
 `MAINS_WATTS` / `BATTERY_WATTS` at the top of `/usr/local/bin/ups-gpu-power`,
 then `sudo systemctl restart ups-gpu-power`. `HARD_MAX` should not move
 without a measured power path.
+
+## Power ledger
+
+`power-ledger` is a service that records outages and power draw in
+`/var/lib/power-ledger/ledger.db`: a row every 60 s on mains, every 5 s on
+battery, and one the moment the UPS status byte changes (status, charge,
+runtime, load, input and battery volts, PSU DC output, GPU watts and limit). It
+only reads the UPS (opened read-only, GET_FEATURE only; a test enforces it) and
+never touches `ups-gpu-power`.
+
+```bash
+power-ledger status | tail | outages [--days N] | energy [--days N]
+```
+
+Install: `sudo /home/pctablet505/Projects/hostops/install.sh power-ledger`.
+Roll back: `sudo systemctl disable --now power-ledger`, delete
+`/etc/systemd/system/power-ledger.service` and `/usr/local/bin/power-ledger`,
+then `sudo systemctl daemon-reload`. The data stays until you delete it.
