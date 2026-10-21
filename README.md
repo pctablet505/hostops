@@ -1,19 +1,19 @@
 <a href="docs/UPS-GPU-POWER.md">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.svg">
-  <img src="assets/hero-light.svg" width="100%" alt="hostops. The GPU's power limit follows the UPS, not a fixed number. Root-level services for one GPU workstation: a power cap and a power ledger.">
+  <img src="assets/hero-light.svg" width="100%" alt="hostops. The GPU's power limit follows the UPS, not a fixed number.">
 </picture>
 </a>
 
-**The GPU's power limit follows the UPS, not a fixed number.** hostops holds the root-level services of one GPU
-workstation: a daemon that sets the GPU power limit from the UPS state, and a ledger of outages and power draw.
+On mains the GPU may draw 550 W. When the UPS reports a power cut, hostops drops the limit to 200 W, and when it
+cannot tell, it picks 200 W too. It also keeps a ledger of outages and power draw.
 
 Why a daemon, and not a cron job? The answer is in how the UPS reports a power cut.
 **[Read the policy and the reason →](docs/UPS-GPU-POWER.md)**
 
 ## What you get
 
-- **`ups-gpu-power`**: 550 W on mains, 200 W on battery, and 200 W when the state is unknown. It never fails open.
+- **`ups-gpu-power`**: the daemon that sets the GPU power limit from the UPS state. It never fails open.
 - **`power-ledger`**: records UPS outages and power draw to SQLite, with a command to query it.
 
 ## Is it for you?
