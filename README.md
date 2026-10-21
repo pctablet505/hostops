@@ -2,7 +2,7 @@
 
 **A worked example for one machine.** When the mains fails, a GPU at full power empties a UPS battery in minutes.
 hostops drops the GPU's power limit the moment the UPS reports the cut, and keeps a ledger: a SQLite log of the cuts
-and the power draw.
+and the power draw. [The policy and its reasons, one page →](docs/UPS-GPU-POWER.md)
 
 <p align="center">
 <picture>
@@ -20,8 +20,8 @@ limit values, so they are left out.
 
 | When | What happened |
 |---|---|
-| t+0 s | The UPS reports battery: load 39%, the power supply drawing 602 W, 540 s of runtime left. The daemon sets the battery limit in the same second. |
-| t+132 s | Mains is back: load 20%, the power supply drawing 288 W, battery at 94%, 1,200 s of runtime left. The mains limit returns in the same second. |
+| t+0 s | The UPS reports battery: load 39%, the power supply delivering 602 W, 540 s of runtime left. The daemon sets the battery limit in the same second. |
+| t+132 s | Mains is back: load 20%, the power supply delivering 288 W, battery at 94%, 1,200 s of runtime left. The mains limit returns in the same second. |
 
 The ledger on this machine holds 16 cuts in the 30 days to 21 October.
 
@@ -29,7 +29,7 @@ The ledger on this machine holds 16 cuts in the 30 days to 21 October.
 
 - **`ups-gpu-power` waits for the UPS to speak.** The UPS (a CyberPower OLS2000EC on USB) pushes a status report the
   instant it moves to battery, so a blocking read reacts in milliseconds; a cron job would leave the GPU at full power
-  for the whole polling interval. It runs as root, to set the GPU's power limit through nvidia-smi and to open the UPS's USB device.
+  for the whole polling interval. It runs as root, to set the GPU's power limit through nvidia-smi and to open the UPS's USB device, so it lives apart from [Servedeck](https://github.com/pctablet505/servedeck), which uses no sudo.
 - **`power-ledger` writes it down.** A row every 60 s on mains and every 5 s on battery, plus one the moment the UPS
   status changes. It only reads the UPS.
 
@@ -46,12 +46,12 @@ are one page.
 ## Limits
 
 - One UPS model: the udev rule, the Linux rule that lets the service open the UPS's USB device, matches only it.
-- `install.sh` runs `power-ledger` as the user `pctablet505`, and the doc uses this machine's paths: edit both.
-- No licence file yet, so ask before reusing the code.
+- `install.sh` and `systemd/power-ledger.service` run `power-ledger` as the user `pctablet505`, and the doc uses this
+  machine's paths: edit all three.
 - It protects battery runtime, not the UPS rating.
 - Not measured: the battery runtime at the 200 W limit, and how much slower GPU work runs under it.
 
 ---
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/mark-dark.svg"><img src="assets/mark-light.svg" width="16" height="16" alt=""></picture>
-<sub>**Real numbers, failures left in.** One of the [tools of RL Alpha Labs](https://rlalphalabs.com/tools/), built by [pctablet505](https://github.com/pctablet505).</sub>
+<sub>**Real numbers, failures left in.** One of the [tools of RL Alpha Labs](https://rlalphalabs.com/tools/), built by [pctablet505](https://github.com/pctablet505). Apache-2.0 licensed, see [LICENSE](LICENSE).</sub>
